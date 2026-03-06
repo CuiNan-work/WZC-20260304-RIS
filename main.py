@@ -38,7 +38,8 @@ ris_M = 64              # RIS反射单元数
 
 lam = 0.1               # 波长 (m) (3GHz)
 d_elem = lam / 2
-PL0 = 1e-3              # 参考路径损耗
+PL0 = 1e-7              # 参考路径损耗
+alpha = 2.0             # 路径损耗指数（增大以加强信道衰减，使通信时延更显著）
 
 B_total = 20e6           # 总带宽 (Hz) 20MHz
 P = 0.1                 # GT发射功率(W)
@@ -51,6 +52,9 @@ C = 800                # 每比特CPU周期数
 
 F_max = 2800           # 无人机最大计算资源(MHz)
 F_local = 500             # GT计算能力(MHz)
+
+P_uav = 0.3             # UAV下行发射功率(W)，用于回传结果
+delta = 0.2             # 回传数据比例（计算结果大小 / 原始任务大小）
 
 move_distance = 5      # 无人机移动距离(m)
 max_steps = 2048        # 每个episode最大步数
@@ -98,6 +102,8 @@ class UAVEnv(gym.Env):
 
         # 通信时延
         self.users_comm_delay = [0] * num_users
+        # 回传时延（UAV计算完成后将结果返回GT）
+        self.users_return_delay = [0] * num_users
         # 计算时延(包括无人机和本地计算)
         self.users_comp_delay = [0] * num_users
         # 总时延
@@ -183,6 +189,7 @@ class UAVEnv(gym.Env):
         self.uav_L = [0] * num_uavs  # 无人机负载
 
         self.users_comm_delay = [0] * num_users # 通信时延
+        self.users_return_delay = [0] * num_users # 回传时延
         self.users_comp_delay = [0] * num_users # 计算时延(包括无人机和本地计算)
         self.total_time = 0 # 总时延
 
@@ -242,6 +249,9 @@ class UAVEnv(gym.Env):
         # 任务计算时延
         self.comp_delay()
 
+        # 回传时延
+        self.return_delay()
+
         # 计算总时延
         self.compute_total_delay()
 
@@ -288,6 +298,7 @@ class UAVEnv(gym.Env):
             "composite_channel": self.compute_Composite_channel().copy(),
             "unload_rate": unload_rate_matrix.copy(),
             "comm_delay": np.array(self.users_comm_delay).copy(),
+            "return_delay": np.array(self.users_return_delay).copy(),
             "comp_delay": np.array(self.users_comp_delay).copy(),
             "user_decisions": self.user_decisions.copy(),
             "user_unload_rates": user_unload_rates.copy(),
@@ -359,7 +370,7 @@ class UAVEnv(gym.Env):
             phase_terms = np.exp(-1j * 2 * np.pi / lam * np.arange(ris_M) * d_elem * gamma_ur)
 
             # 计算信道增益
-            h_ur[m] = np.sqrt(PL0) / d_ur * phase_terms[:,np.newaxis] # 复数向量
+            h_ur[m] = np.sqrt(PL0) / d_ur ** (alpha / 2) * phase_terms[:,np.newaxis] # 复数向量
 
         return h_ur
 
@@ -381,7 +392,7 @@ class UAVEnv(gym.Env):
             phase_terms = np.exp(-1j * 2 * np.pi / lam * np.arange(ris_M) * d_elem * gamma_rg)
 
             # 计算信道增益
-            h_rg[k] = np.sqrt(PL0) / d_rg * phase_terms[:,np.newaxis] # 复数向量
+            h_rg[k] = np.sqrt(PL0) / d_rg ** (alpha / 2) * phase_terms[:,np.newaxis] # 复数向量
 
         return h_rg
 
@@ -444,7 +455,7 @@ class UAVEnv(gym.Env):
                 # 阻塞概率
                 prob = blockage_prob[m, k]
                 h_urg_2 = np.abs(h_urg[m, k]) ** 2  # 复数标量取模的平方
-                composite_channel[m, k] = prob * h_urg_2 + (1.0 - prob) * ( PL0 / self.UAV_GT[m, k] ** 2 )
+                composite_channel[m, k] = prob * h_urg_2 + (1.0 - prob) * ( PL0 / self.UAV_GT[m, k] ** alpha )
 
         return composite_channel
 
@@ -525,9 +536,37 @@ class UAVEnv(gym.Env):
 
         self.users_comp_delay = comp_delay
 
+    # 回传时延（UAV计算完成后将结果返回GT）
+    def return_delay(self):
+        composite_channel = self.compute_Composite_channel()
+        ret_delay = [0] * num_users
+
+        uav_user_count = np.zeros(num_uavs)
+        for k in range(num_users):
+            uav_id = self.user_decisions[k]
+            if uav_id > 0:
+                uav_user_count[uav_id - 1] += 1
+
+        for k in range(num_users):
+            uav_id = self.user_decisions[k]
+            if uav_id == 0:
+                ret_delay[k] = 0  # 本地计算无需回传
+            else:
+                m = uav_id - 1
+                N = uav_user_count[m]
+                if N == 0:
+                    continue
+                h_km_squared = composite_channel[m, k]
+                SNR = P_uav * h_km_squared / P_n_W
+                r_down = (B_total / N) * np.log2(1 + SNR) * 1e-6  # Mbps
+                r_down = max(r_down, 1e-9)  # 防止除零
+                ret_delay[k] = (delta * self.user_tasks[k]) / r_down
+
+        self.users_return_delay = ret_delay
+
     # 计算总时延
     def compute_total_delay(self):
-        self.total_time = np.sum(self.users_comp_delay) + np.sum(self.users_comm_delay)
+        self.total_time = np.sum(self.users_comp_delay) + np.sum(self.users_comm_delay) + np.sum(self.users_return_delay)
 
     # 计算每个step的jain指数
     def compute_Jain(self):
@@ -561,7 +600,7 @@ class UAVEnv(gym.Env):
         max_distance_3d = np.sqrt(max_distance_horizontal ** 2 + uav_H ** 2)
 
         # 最差信道增益
-        h_worst = PL0 / (max_distance_3d ** 2)
+        h_worst = PL0 / (max_distance_3d ** alpha)
 
         # 最差卸载速率（所有用户竞争带宽）
         SNR_worst = P * h_worst / P_n_W
@@ -571,11 +610,17 @@ class UAVEnv(gym.Env):
         # 最坏通信延迟
         D_comm_worst = max_task_per_user / R_worst_Mbps
 
+        # 最坏回传延迟
+        SNR_worst_down = P_uav * h_worst / P_n_W
+        R_worst_down = (B_total / num_users) * np.log2(1 + SNR_worst_down)
+        R_worst_down_Mbps = max(R_worst_down * 1e-6, 1e-6)
+        D_return_worst = (delta * max_task_per_user) / R_worst_down_Mbps
+
         # 最坏计算延迟（所有任务由单个UAV顺序执行）
         D_comp_worst = (total_max_task * C) / F_max
 
         # 总的最坏延迟
-        max_delay_offload = D_comm_worst + D_comp_worst
+        max_delay_offload = D_comm_worst + D_return_worst + D_comp_worst
 
         # 取两种情况的最大值，加20%安全余量
         self.max_delay_theoretical = max(max_delay_local, max_delay_offload) * 1.2
@@ -586,7 +631,7 @@ class UAVEnv(gym.Env):
         ideal_distance_horizontal = 100  # 假设平均距离100m
         ideal_distance_3d = np.sqrt(ideal_distance_horizontal ** 2 + uav_H ** 2)
 
-        h_best = PL0 / (ideal_distance_3d ** 2)
+        h_best = PL0 / (ideal_distance_3d ** alpha)
 
         # 用户均匀分配
         users_per_uav = num_users / num_uavs
@@ -600,11 +645,17 @@ class UAVEnv(gym.Env):
         min_task_per_user = L_min
         D_comm_best = min_task_per_user / R_best_Mbps
 
+        # 最好回传延迟
+        SNR_best_down = P_uav * h_best / P_n_W
+        R_best_down = B_per_user * np.log2(1 + SNR_best_down)
+        R_best_down_Mbps = R_best_down * 1e-6
+        D_return_best = (delta * min_task_per_user) / R_best_down_Mbps
+
         # 完美负载均衡的计算延迟
         avg_load_per_uav = (np.mean([L_min, L_max]) * num_users / num_uavs)
         D_comp_best = (avg_load_per_uav * C) / F_max
 
-        self.min_delay_theoretical = D_comm_best + D_comp_best
+        self.min_delay_theoretical = D_comm_best + D_return_best + D_comp_best
 
 
         # 打印信息
@@ -713,6 +764,7 @@ class CustomPrintCallback(BaseCallback):
             # 每个用户的决策 + 时延 + 任务量（关键修复！）
             decisions = info["user_decisions"]
             comm_d = info["comm_delay"]
+            return_d = info["return_delay"]
             comp_d = info["comp_delay"]
             rates = info["user_unload_rates"]
 
@@ -723,7 +775,7 @@ class CustomPrintCallback(BaseCallback):
             for k in range(num_users):
                 mode = "Local" if decisions[k] == 0 else f"UAV{decisions[k]}"
                 task = current_env.user_tasks[k]
-                print(f"    GT{k:1d}: {mode:5s} | Comm: {comm_d[k]:6.4f}s | Comp: {comp_d[k]:6.4f}s | "f"Task: {task:.3f} Mbit | Rate: {rates[k]:6.2f} Mbps")
+                print(f"    GT{k:1d}: {mode:5s} | Comm: {comm_d[k]:6.4f}s | Return: {return_d[k]:6.4f}s | Comp: {comp_d[k]:6.4f}s | "f"Task: {task:.3f} Mbit | Rate: {rates[k]:6.2f} Mbps")
 
             print(f"{'='*90}\n")
 
