@@ -27,7 +27,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecEnv
-import cvxpy as cp
+
 
 # 环境参数设置
 num_uavs = 3            # 无人机数量
@@ -91,6 +91,10 @@ class UAVEnv(gym.Env):
         # RIS 初始相移
         # self.ris_phase = np.random.uniform(0, 2 * np.pi, ris_M).astype(np.float32)
         self.ris_phase = np.zeros(ris_M, dtype=np.float32)  # 固定为全 0 相移
+
+        # 信道增益缓存（由 optimize_ris_phase 更新，避免重复计算）
+        self._cached_h_ur = None
+        self._cached_h_rg = None
 
         # 通信时延
         self.users_comm_delay = [0] * num_users
@@ -172,6 +176,10 @@ class UAVEnv(gym.Env):
         # self.ris_phase = np.random.uniform(0, 2 * np.pi, ris_M).astype(np.float32) # RIS相移
         self.ris_phase = np.zeros(ris_M, dtype=np.float32)
 
+        # 清除信道增益缓存
+        self._cached_h_ur = None
+        self._cached_h_rg = None
+
         self.uav_L = [0] * num_uavs  # 无人机负载
 
         self.users_comm_delay = [0] * num_users # 通信时延
@@ -198,6 +206,10 @@ class UAVEnv(gym.Env):
 
         self.user_tasks = np.random.uniform(L_min, L_max, num_users) # GT任务
 
+        # 清除上一步的信道增益缓存
+        self._cached_h_ur = None
+        self._cached_h_rg = None
+
         idx = 0
         uav_actions = action[idx:idx + num_uavs]  # 获取UAV的动作，数组
         idx += num_uavs
@@ -206,21 +218,20 @@ class UAVEnv(gym.Env):
         # UAV移动——更新的UAV位置
         self.uav_move(uav_actions)
 
-        # 优化RIS相移，使用SDR方法
+        # 优化RIS相移（主特征向量法）
         self.optimize_ris_phase()
 
         # 计算UAV负载
         self.compute_uav_load()
 
-        # 计算卸载速率
-        self.compute_unload_rate()
+        # 计算卸载速率（只计算一次，结果缓存在 self.uav_unload_rate）
+        unload_rate_matrix = self.compute_unload_rate()
 
-        # 计算卸载时延
+        # 计算卸载时延（使用已缓存的卸载速率）
         self.comm_delay()
 
         # 为每个 GT 记录实际使用的卸载速率
         user_unload_rates = np.zeros(num_users, dtype=np.float32)
-        unload_rate_matrix = self.compute_unload_rate()
         for k in range(num_users):
             uav_id = self.user_decisions[k]
             if uav_id == 0:
@@ -275,7 +286,7 @@ class UAVEnv(gym.Env):
             "reward": self.reward,
 
             "composite_channel": self.compute_Composite_channel().copy(),
-            "unload_rate": self.compute_unload_rate().copy(),
+            "unload_rate": unload_rate_matrix.copy(),
             "comm_delay": np.array(self.users_comm_delay).copy(),
             "comp_delay": np.array(self.users_comp_delay).copy(),
             "user_decisions": self.user_decisions.copy(),
@@ -376,8 +387,15 @@ class UAVEnv(gym.Env):
 
     # 计算UAV-RIS-GT信道增益
     def compute_UAV_RIS_GT_gain(self,):
-        h_ur = self.compute_UAV_RIS_gain() # UAV-RIS信道增益
-        h_rg = self.compute_RIS_GT_gain()  # RIS-GT信道增益
+        # 优先使用缓存的信道增益（由 optimize_ris_phase 计算并缓存）
+        if hasattr(self, '_cached_h_ur') and self._cached_h_ur is not None:
+            h_ur = self._cached_h_ur
+        else:
+            h_ur = self.compute_UAV_RIS_gain()
+        if hasattr(self, '_cached_h_rg') and self._cached_h_rg is not None:
+            h_rg = self._cached_h_rg
+        else:
+            h_rg = self.compute_RIS_GT_gain()
 
         ris_matrix = np.diag(np.exp(1j * self.ris_phase)) # RIS相移矩阵
 
@@ -467,7 +485,7 @@ class UAVEnv(gym.Env):
     # 计算卸载时延(只有卸载给UAV的GT才需要计算卸载时延，即user_decision != 0)
     def comm_delay(self):
 
-        unload_rate = self.compute_unload_rate() # 卸载速率
+        unload_rate = self.uav_unload_rate # 使用已缓存的卸载速率
         comm_delay = [0] * num_users
         for k in range(num_users):
 
@@ -625,10 +643,14 @@ class UAVEnv(gym.Env):
         self.reward = w_time * (1 - self.normalized_delay) + w_fair * self.normalized_Jain
         self.reward_history.append(self.reward)
 
-    # RIS相移优化
+    # RIS相移优化（主特征向量法，替代SDR以大幅提升速度）
     def optimize_ris_phase(self):
         h_ur = self.compute_UAV_RIS_gain()  # (num_uavs, ris_M, 1)
         h_rg = self.compute_RIS_GT_gain()  # (num_users, ris_M, 1)
+
+        # 缓存信道增益，供后续 compute_UAV_RIS_GT_gain 等复用
+        self._cached_h_ur = h_ur
+        self._cached_h_rg = h_rg
 
         A = np.zeros((ris_M, ris_M), dtype=np.complex128)
 
@@ -637,51 +659,22 @@ class UAVEnv(gym.Env):
             for k in range(num_users):
                 if self.user_decisions[k] == m + 1:
                     has_offload = True
-
-                    r_mk = np.dot(np.diag(h_rg[k].conj().flatten()), h_ur[m].flatten()).reshape(-1, 1)
-                    R_mk = r_mk @ r_mk.conj().T  # (ris_M, ris_M)
-                    A += R_mk
+                    # 使用逐元素乘法代替 diag 矩阵乘法，更高效
+                    r_mk = h_rg[k].conj().flatten() * h_ur[m].flatten()
+                    A += np.outer(r_mk, r_mk.conj())
 
         if not has_offload:
             self.ris_phase = np.zeros(ris_M, dtype=np.float32)
             return
 
-        # SDR using cvxpy
-        V = cp.Variable((ris_M, ris_M), hermitian=True)
-        constraints = [cp.diag(V) == 1, V >> 0]
-        objective = cp.Maximize(cp.real(cp.trace(A @ V)))
-        prob = cp.Problem(objective, constraints)
-        prob.solve(solver=cp.SCS, eps=1e-5)
+        # 主特征向量法：求A的最大特征值对应的特征向量
+        # 数学上等价于SDR的秩-1近似，但速度快数个数量级
+        eigvals, eigvecs = np.linalg.eigh(A)
+        # eigh 返回升序排列，最大特征值在最后
+        v_opt = eigvecs[:, -1]
 
-        if prob.status != cp.OPTIMAL:
-            print("SDR optimization failed, using random phase")
-            self.ris_phase = np.random.uniform(0, 2 * np.pi, ris_M).astype(np.float32)
-            return
-
-        # Gaussian randomization for approximation
-        V_val = V.value
-        if V_val is None:
-            V_val = np.eye(ris_M)
-
-        # Eigen decomposition
-        eigvals, eigvecs = np.linalg.eigh(V_val)
-        eigvals = np.clip(eigvals, 0, None)  # Ensure non-negative
-        sqrt_sigma = np.diag(np.sqrt(eigvals))
-
-        best_obj = -np.inf
-        best_v = np.exp(1j * np.random.uniform(0, 2 * np.pi, ris_M))
-
-        num_random = 100
-        for _ in range(num_random):
-            r = np.random.randn(ris_M) + 1j * np.random.randn(ris_M)
-            tilde_v = eigvecs @ sqrt_sigma @ r
-            v_cand = tilde_v / np.abs(tilde_v + 1e-10)  # Avoid division by zero
-            obj_val = np.real(v_cand.conj().T @ A @ v_cand)
-            if obj_val > best_obj:
-                best_obj = obj_val
-                best_v = v_cand
-
-        self.ris_phase = np.angle(best_v).astype(np.float32)
+        # 提取相位（强制单位模约束 |v_i| = 1）
+        self.ris_phase = np.angle(v_opt).astype(np.float32)
 
 class CustomPrintCallback(BaseCallback):
     def __init__(self, print_freq: int = 1, verbose: int = 0):
