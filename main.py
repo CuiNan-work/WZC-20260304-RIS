@@ -388,11 +388,11 @@ class UAVEnv(gym.Env):
     # 计算UAV-RIS-GT信道增益
     def compute_UAV_RIS_GT_gain(self,):
         # 优先使用缓存的信道增益（由 optimize_ris_phase 计算并缓存）
-        if hasattr(self, '_cached_h_ur') and self._cached_h_ur is not None:
+        if self._cached_h_ur is not None:
             h_ur = self._cached_h_ur
         else:
             h_ur = self.compute_UAV_RIS_gain()
-        if hasattr(self, '_cached_h_rg') and self._cached_h_rg is not None:
+        if self._cached_h_rg is not None:
             h_rg = self._cached_h_rg
         else:
             h_rg = self.compute_RIS_GT_gain()
