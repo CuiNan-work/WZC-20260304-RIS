@@ -628,7 +628,9 @@ class UAVEnv(gym.Env):
         # 最坏计算延迟（所有任务由单个UAV顺序执行，每个用户时延 = uav_load * C / F_max）
         D_comp_worst = (total_max_task * C) / F_max
 
-        # 总的最坏延迟（total_time是所有用户时延之和，需乘以num_users）
+        # 总的最坏延迟
+        # total_time = sum(每个用户时延)，而上面D_comm/D_return/D_comp是单个用户的时延
+        # 因此需要乘以num_users将单用户时延转换为全系统时延之和
         max_delay_offload = num_users * (D_comm_worst + D_return_worst + D_comp_worst)
 
         # 取两种情况的最大值，加20%安全余量
@@ -664,7 +666,7 @@ class UAVEnv(gym.Env):
         avg_load_per_uav = (np.mean([L_min, L_max]) * num_users / num_uavs)
         D_comp_best = (avg_load_per_uav * C) / F_max
 
-        # total_time是所有用户时延之和，需乘以num_users
+        # total_time = sum(每个用户时延)，乘以num_users将单用户时延转换为全系统时延之和
         self.min_delay_theoretical = num_users * (D_comm_best + D_return_best + D_comp_best)
 
 
@@ -700,10 +702,11 @@ class UAVEnv(gym.Env):
 
     # 计算接近度奖励（激励UAV靠近GT以获取更好的信道）
     def compute_proximity_reward(self):
-        self.compute_UAV_GT()  # 确保 UAV-GT 距离已计算
-        max_dist = np.sqrt(800**2 + uav_H**2)  # 最大可能3D距离
+        self.compute_UAV_GT()  # 确保 UAV-GT 距离已计算, shape: (num_uavs, num_users)
+        # 区域边界[-400,400], 最大水平距离 = 2*400 = 800m
+        max_dist = np.sqrt((2 * 400)**2 + uav_H**2)  # 最大可能3D距离
 
-        # 对每个GT，找到最近UAV的距离
+        # 对每个GT(列方向)，找到最近UAV(行方向)的距离
         min_dist_per_user = np.min(self.UAV_GT, axis=0)  # (num_users,)
         avg_min_dist = np.mean(min_dist_per_user)
 
