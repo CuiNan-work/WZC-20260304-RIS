@@ -66,8 +66,9 @@ blk_a = 0.05
 blk_b = 0.005
 
 # 奖励权重
-w_time = 0.6
-w_fair = 0.4
+w_time = 0.5
+w_fair = 0.3
+w_dist = 0.2
 
 class UAVEnv(gym.Env):
     def __init__(self, render_mode=None):
@@ -124,6 +125,9 @@ class UAVEnv(gym.Env):
         # 归一化Jain
         self.normalized_Jain = 0
 
+        # 接近度奖励
+        self.proximity_reward = 0
+
         # 奖励
         self.reward = 0
         self.reward_history = []  #  step奖励历史数据
@@ -142,7 +146,8 @@ class UAVEnv(gym.Env):
             4: np.array([0, -1]),  # 下
             5: np.array([-1, -1]),  # 左下
             6: np.array([-1, 0]),  # 左
-            7: np.array([-1, 1])  # 左上
+            7: np.array([-1, 1]),  # 左上
+            8: np.array([0, 0])   # 悬停（stay）
         }
 
         # 无人机之间距离
@@ -159,7 +164,7 @@ class UAVEnv(gym.Env):
 
         # 动作空间
         self.action_space = spaces.MultiDiscrete(
-            [8] * num_uavs +   # UAV 移动方向 (0~7)
+            [9] * num_uavs +   # UAV 移动方向 (0~7移动, 8悬停)
             [4] * num_users    # GT 卸载决策 (0~3)
         )
 
@@ -203,6 +208,7 @@ class UAVEnv(gym.Env):
 
         self.normalized_delay = 0 # 归一化时延
         self.normalized_Jain = 0  # 归一化Jain
+        self.proximity_reward = 0  # 接近度奖励
 
         obs = self._get_obs()
         info = {}
@@ -261,6 +267,9 @@ class UAVEnv(gym.Env):
         # 归一化
         self.normalize_delay()
         self.normalize_Jain()
+
+        # 计算接近度奖励
+        self.proximity_reward = self.compute_proximity_reward()
 
         # 计算step奖励
         self.compute_step_reward()
@@ -607,20 +616,20 @@ class UAVEnv(gym.Env):
         R_worst = (B_total / num_users) * np.log2(1 + SNR_worst)
         R_worst_Mbps = max(R_worst * 1e-6, 1e-6)  # 防止过小
 
-        # 最坏通信延迟
+        # 最坏通信延迟（单个用户）
         D_comm_worst = max_task_per_user / R_worst_Mbps
 
-        # 最坏回传延迟
+        # 最坏回传延迟（单个用户）
         SNR_worst_down = P_uav * h_worst / P_n_W
         R_worst_down = (B_total / num_users) * np.log2(1 + SNR_worst_down)
         R_worst_down_Mbps = max(R_worst_down * 1e-6, 1e-6)
         D_return_worst = (delta * max_task_per_user) / R_worst_down_Mbps
 
-        # 最坏计算延迟（所有任务由单个UAV顺序执行）
+        # 最坏计算延迟（所有任务由单个UAV顺序执行，每个用户时延 = uav_load * C / F_max）
         D_comp_worst = (total_max_task * C) / F_max
 
-        # 总的最坏延迟
-        max_delay_offload = D_comm_worst + D_return_worst + D_comp_worst
+        # 总的最坏延迟（total_time是所有用户时延之和，需乘以num_users）
+        max_delay_offload = num_users * (D_comm_worst + D_return_worst + D_comp_worst)
 
         # 取两种情况的最大值，加20%安全余量
         self.max_delay_theoretical = max(max_delay_local, max_delay_offload) * 1.2
@@ -651,11 +660,12 @@ class UAVEnv(gym.Env):
         R_best_down_Mbps = R_best_down * 1e-6
         D_return_best = (delta * min_task_per_user) / R_best_down_Mbps
 
-        # 完美负载均衡的计算延迟
+        # 完美负载均衡的计算延迟（每个用户的计算时延 = avg_load * C / F_max）
         avg_load_per_uav = (np.mean([L_min, L_max]) * num_users / num_uavs)
         D_comp_best = (avg_load_per_uav * C) / F_max
 
-        self.min_delay_theoretical = D_comm_best + D_return_best + D_comp_best
+        # total_time是所有用户时延之和，需乘以num_users
+        self.min_delay_theoretical = num_users * (D_comm_best + D_return_best + D_comp_best)
 
 
         # 打印信息
@@ -688,10 +698,24 @@ class UAVEnv(gym.Env):
 
         self.normalized_Jain = (self.Jain_step - min_jain) / jain_range
 
+    # 计算接近度奖励（激励UAV靠近GT以获取更好的信道）
+    def compute_proximity_reward(self):
+        self.compute_UAV_GT()  # 确保 UAV-GT 距离已计算
+        max_dist = np.sqrt(800**2 + uav_H**2)  # 最大可能3D距离
+
+        # 对每个GT，找到最近UAV的距离
+        min_dist_per_user = np.min(self.UAV_GT, axis=0)  # (num_users,)
+        avg_min_dist = np.mean(min_dist_per_user)
+
+        # 归一化：距离越近，奖励越高
+        return 1.0 - (avg_min_dist / max_dist)
+
     # 计算step奖励
     def compute_step_reward(self):
 
-        self.reward = w_time * (1 - self.normalized_delay) + w_fair * self.normalized_Jain
+        self.reward = (w_time * (1 - self.normalized_delay)
+                       + w_fair * self.normalized_Jain
+                       + w_dist * self.proximity_reward)
         self.reward_history.append(self.reward)
 
     # RIS相移优化（主特征向量法，替代SDR以大幅提升速度）
